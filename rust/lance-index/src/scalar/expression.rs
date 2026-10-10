@@ -1660,9 +1660,11 @@ impl ScalarIndexExpr {
     /// Range queries for the same parsed scalar index are intersected and retain
     /// `needs_recheck` if any input range requires it. An exact `IS NOT NULL`
     /// query is removed when another exact same-index query is null-intolerant.
+    /// Exact, non-null membership supersets are removed when a narrower same-index
+    /// predicate exists, including short IN lists expressed as ORs of equalities.
     /// OR branches are optimized independently. Range queries are still merged
-    /// under NOT, but `IS NOT NULL` elimination is disabled there to preserve
-    /// SQL NULL semantics.
+    /// under NOT, but null and membership elimination are disabled there to
+    /// preserve SQL NULL semantics.
     ///
     /// Compatible [`SargableQuery::Range`] values carried by
     /// [`ScalarIndexSearch`] are merged into one query.
@@ -1763,7 +1765,114 @@ impl ScalarIndexExpr {
             }
         }
 
-        optimized
+        if is_not_null_elidable {
+            Self::remove_membership_supersets(optimized)
+        } else {
+            optimized
+        }
+    }
+
+    /// Remove only proven supersets, retaining the original narrower expression.
+    /// In particular, do not synthesize an empty IN or combine inexact queries.
+    fn remove_membership_supersets(leaves: Vec<Self>) -> Vec<Self> {
+        if leaves.len() < 2 {
+            return leaves;
+        }
+        let memberships = leaves
+            .iter()
+            .map(Self::membership_values)
+            .collect::<Vec<_>>();
+        let mut retained = vec![true; leaves.len()];
+        let mut positions: HashMap<ScalarIndexQueryKey, Vec<usize>> = HashMap::new();
+        for (position, membership) in memberships.iter().enumerate() {
+            let Some((search, values)) = membership else {
+                continue;
+            };
+            let Some(key) = search.exact_sargable_query_key() else {
+                continue;
+            };
+            let previous = positions.entry(key).or_default();
+            for &other_position in previous.iter() {
+                if !retained[other_position] {
+                    continue;
+                }
+                let Some((other_search, other_values)) = &memberships[other_position] else {
+                    continue;
+                };
+                if search.fragment_bitmap != other_search.fragment_bitmap
+                    || values.iter().next().map(ScalarValue::data_type)
+                        != other_values.iter().next().map(ScalarValue::data_type)
+                {
+                    continue;
+                }
+                if other_values.is_subset(values) {
+                    retained[position] = false;
+                    break;
+                }
+                if values.is_subset(other_values) {
+                    retained[other_position] = false;
+                }
+            }
+            if retained[position] {
+                previous.push(position);
+            }
+        }
+        leaves
+            .into_iter()
+            .zip(retained)
+            .filter_map(|(leaf, keep)| keep.then_some(leaf))
+            .collect()
+    }
+
+    /// Recognize one exact membership domain without crossing general OR/NOT
+    /// boundaries. DataFusion expands short IN lists into same-index equalities.
+    fn membership_values(&self) -> Option<(&ScalarIndexSearch, HashSet<ScalarValue>)> {
+        match self {
+            Self::Query(search) => {
+                let values = match search.exact_sargable_query()? {
+                    SargableQuery::Equals(value) => std::slice::from_ref(value),
+                    SargableQuery::IsIn(values) => values.as_slice(),
+                    _ => return None,
+                };
+                let data_type = values.first()?.data_type();
+                // Avoid introducing equality assumptions for floating point,
+                // nested values, or coercion between different literal types.
+                if !matches!(
+                    data_type,
+                    DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                        | DataType::Boolean
+                        | DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                ) || values
+                    .iter()
+                    .any(|value| value.is_null() || value.data_type() != data_type)
+                {
+                    return None;
+                }
+                Some((search, values.iter().cloned().collect()))
+            }
+            Self::Or(lhs, rhs) => {
+                let (search, mut values) = lhs.membership_values()?;
+                let (other_search, other_values) = rhs.membership_values()?;
+                if search.exact_sargable_query_key() != other_search.exact_sargable_query_key()
+                    || search.fragment_bitmap != other_search.fragment_bitmap
+                    || values.iter().next()?.data_type() != other_values.iter().next()?.data_type()
+                {
+                    return None;
+                }
+                values.extend(other_values);
+                Some((search, values))
+            }
+            _ => None,
+        }
     }
 
     /// Recursively collect all leaf nodes from an AND tree. OR branches are
@@ -2651,7 +2760,7 @@ impl PlannerIndexExt for Planner {
 mod tests {
     use std::collections::HashMap;
 
-    use arrow_array::Array;
+    use arrow_array::{Array, record_batch};
     use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
@@ -4848,6 +4957,260 @@ mod tests {
     ) -> Vec<ScalarIndexExpr> {
         let indexed = parse_int64_filter(expr, index_info);
         collect_test_and_leaves(indexed.scalar_query.unwrap().optimize())
+    }
+
+    // Redundant membership predicates must not open the superset's index parts.
+    // Keep the narrower expression intact, including a shortened IN's OR tree.
+    #[rstest]
+    #[case::wide_first(vec![1, 2, 3, 4], vec![2, 3])]
+    #[case::narrow_first(vec![2, 3], vec![1, 2, 3, 4])]
+    #[case::equal_sets(vec![1, 2, 3], vec![3, 2, 1])]
+    fn test_optimize_removes_membership_superset(#[case] lhs: Vec<i64>, #[case] rhs: Vec<i64>) {
+        let query = |values: Vec<i64>| {
+            test_scalar_query(
+                "x",
+                "idx_x",
+                SargableQuery::IsIn(
+                    values
+                        .into_iter()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .collect(),
+                ),
+            )
+        };
+        let expected_len = lhs.len().min(rhs.len());
+        let leaves =
+            collect_test_and_leaves(test_and_terms(vec![query(lhs), query(rhs)]).optimize());
+        assert_eq!(leaves.len(), 1);
+        let ScalarIndexExpr::Query(search) = &leaves[0] else {
+            panic!("expected the narrower membership query");
+        };
+        assert!(
+            matches!(search.sargable_query(), Some(SargableQuery::IsIn(values)) if values.len() == expected_len)
+        );
+    }
+
+    #[rstest]
+    #[case::short_in("x IN (1,2,3,4,5) AND x IN (2,3)", "x IN (2,3)")]
+    #[case::equality("x IN (1,2,3,4,5) AND x = 2", "x = 2")]
+    fn test_optimize_parser_removes_membership_superset(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        let info = int64_index_info("Bitmap", false);
+        let actual = parse_int64_filter(input, &info)
+            .scalar_query
+            .unwrap()
+            .optimize();
+        let expected = parse_int64_filter(expected, &info)
+            .scalar_query
+            .unwrap()
+            .optimize();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::partial_overlap(vec![Some(1), Some(2)], vec![Some(2), Some(3)])]
+    #[case::disjoint(vec![Some(1)], vec![Some(2)])]
+    #[case::null_item(vec![Some(1), Some(2), None], vec![Some(1)])]
+    #[case::all_null(vec![None], vec![Some(1)])]
+    #[case::empty(vec![], vec![Some(1)])]
+    fn test_optimize_preserves_non_subset_membership(
+        #[case] lhs: Vec<Option<i64>>,
+        #[case] rhs: Vec<Option<i64>>,
+    ) {
+        let query = |values: Vec<Option<i64>>| {
+            test_scalar_query(
+                "x",
+                "idx_x",
+                SargableQuery::IsIn(values.into_iter().map(ScalarValue::Int64).collect()),
+            )
+        };
+        let original = test_and_terms(vec![query(lhs), query(rhs)]);
+        assert_eq!(original.clone().optimize(), original);
+    }
+
+    #[rstest]
+    #[case::column("column")]
+    #[case::index_name("index_name")]
+    #[case::index_type("index_type")]
+    #[case::coverage("coverage")]
+    #[case::recheck("recheck")]
+    #[case::value_type("value_type")]
+    fn test_optimize_preserves_membership_with_different_metadata(#[case] difference: &str) {
+        let wide = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsIn(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+            ]),
+        );
+        let mut narrow = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let ScalarIndexExpr::Query(search) = &mut narrow else {
+            unreachable!()
+        };
+        match difference {
+            "column" => search.column = "y".into(),
+            "index_name" => search.index_name = "other_idx".into(),
+            "index_type" => search.index_type = "Bitmap".into(),
+            "coverage" => search.fragment_bitmap = Some([0_u32].into_iter().collect()),
+            "recheck" => search.needs_recheck = true,
+            "value_type" => {
+                search.query = Arc::new(SargableQuery::Equals(ScalarValue::Int32(Some(1))))
+            }
+            _ => unreachable!(),
+        }
+        let original = test_and_terms(vec![wide, narrow]);
+        assert_eq!(original.clone().optimize(), original);
+    }
+
+    #[test]
+    fn test_optimize_membership_does_not_cross_boolean_boundaries() {
+        let wide = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsIn(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+            ]),
+        );
+        let narrow = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let other = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(2))),
+        );
+        let mixed_or = ScalarIndexExpr::Or(Box::new(narrow.clone()), Box::new(other));
+        let original = test_and_terms(vec![wide.clone(), mixed_or]);
+        assert_eq!(original.clone().optimize(), original);
+        let under_not = ScalarIndexExpr::Not(Box::new(test_and_terms(vec![wide, narrow])));
+        assert_eq!(under_not.clone().optimize(), under_not);
+    }
+
+    #[test]
+    fn test_optimize_membership_superset_across_nested_and() {
+        let wide = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsIn(vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+            ]),
+        );
+        let narrow = test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let other = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(3))),
+        );
+        let actual = test_and_terms(vec![wide, other.clone(), narrow.clone()]).optimize();
+        assert_eq!(actual, test_and_terms(vec![other, narrow]));
+    }
+
+    #[test]
+    fn test_optimize_membership_supersets_are_idempotent() {
+        let query = |values: &[i64]| {
+            test_scalar_query(
+                "x",
+                "idx_x",
+                SargableQuery::IsIn(
+                    values
+                        .iter()
+                        .map(|v| ScalarValue::Int64(Some(*v)))
+                        .collect(),
+                ),
+            )
+        };
+        let narrow = query(&[2]);
+        let original = test_and_terms(vec![query(&[1, 2]), query(&[2, 3]), narrow.clone()]);
+        let optimized = original.optimize();
+        assert_eq!(optimized, narrow);
+        assert_eq!(optimized.clone().optimize(), optimized);
+    }
+
+    #[test]
+    fn test_optimize_preserves_floating_point_membership() {
+        let original = test_and_terms(vec![
+            test_scalar_query(
+                "x",
+                "idx_x",
+                SargableQuery::IsIn(vec![
+                    ScalarValue::Float64(Some(1.0)),
+                    ScalarValue::Float64(Some(f64::NAN)),
+                ]),
+            ),
+            test_scalar_query(
+                "x",
+                "idx_x",
+                SargableQuery::Equals(ScalarValue::Float64(Some(1.0))),
+            ),
+        ]);
+        assert_eq!(original.clone().optimize(), original);
+    }
+
+    #[test]
+    fn test_optimize_removes_utf8_membership_superset() {
+        let query = |values: &[&str]| {
+            test_scalar_query(
+                "month",
+                "month_idx",
+                SargableQuery::IsIn(
+                    values
+                        .iter()
+                        .map(|v| ScalarValue::Utf8(Some((*v).into())))
+                        .collect(),
+                ),
+            )
+        };
+        let wide = query(&["202607", "202608", "202609", "202610"]);
+        let narrow = query(&["202608", "202609", "202609"]);
+        assert_eq!(
+            test_and_terms(vec![wide, narrow.clone()]).optimize(),
+            narrow
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_membership_preserves_nullable_column_values() {
+        let info = int64_index_info("Bitmap", false);
+        let original = parse_int64_filter("x IN (1,2,3,4,5) AND x IN (2,3)", &info)
+            .scalar_query
+            .unwrap();
+        let optimized = original.clone().optimize();
+        let input =
+            record_batch!(("x", Int64, [None, Some(1), Some(2), Some(3), Some(6)])).unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let actual = ctx
+            .read_batch(input.clone())
+            .unwrap()
+            .select(vec![optimized.to_expr().alias("result")])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let expected = ctx
+            .read_batch(input)
+            .unwrap()
+            .select(vec![original.to_expr().alias("result")])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual[0].column(0).is_null(0));
     }
 
     #[test]
