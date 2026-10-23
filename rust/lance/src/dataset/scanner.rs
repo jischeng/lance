@@ -16499,7 +16499,7 @@ mod test {
     #[case::miss("missing", 0)]
     #[tokio::test]
     async fn test_redundant_in_conjunction_index_plan(#[case] clip: &str, #[case] rows: usize) {
-        let batch = record_batch!(
+        let batch = arrow_array::record_batch!(
             (
                 "clip",
                 Utf8,
