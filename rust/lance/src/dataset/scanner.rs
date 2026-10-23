@@ -16494,6 +16494,96 @@ mod test {
         assert_plan_node_equals(exec_plan, expected).await
     }
 
+    #[rstest]
+    #[case::hit("target", 2)]
+    #[case::miss("missing", 0)]
+    #[tokio::test]
+    async fn test_redundant_in_conjunction_index_plan(#[case] clip: &str, #[case] rows: usize) {
+        let batch = record_batch!(
+            (
+                "clip",
+                Utf8,
+                [
+                    Some("target"),
+                    Some("target"),
+                    Some("other"),
+                    None,
+                    Some("target"),
+                    Some("target")
+                ]
+            ),
+            (
+                "month",
+                Utf8,
+                [
+                    Some("202608"),
+                    Some("202609"),
+                    Some("202607"),
+                    Some("202608"),
+                    None,
+                    Some("202601")
+                ]
+            )
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for (column, index_type, builtin) in [
+            ("clip", IndexType::BTree, BuiltinIndexType::BTree),
+            ("month", IndexType::Bitmap, BuiltinIndexType::Bitmap),
+        ] {
+            dataset
+                .create_index(
+                    &[column],
+                    index_type,
+                    None,
+                    &ScalarIndexParams::for_builtin(builtin),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let narrow = format!("clip = '{clip}' AND month IN ('202607','202608','202609')");
+        let redundant = format!(
+            "clip IS NOT NULL AND month IN ('202601','202602','202603','202604','202605','202606','202607','202608','202609','202610') AND {narrow}"
+        );
+        let mut narrow_scan = dataset.scan();
+        narrow_scan.filter(&narrow).unwrap();
+        let narrow_plan = narrow_scan.explain_plan(false).await.unwrap();
+        assert!(narrow_plan.contains("ScalarIndexQuery"), "{narrow_plan}");
+        let mut redundant_scan = dataset.scan();
+        redundant_scan.filter(&redundant).unwrap();
+        let redundant_plan = redundant_scan.explain_plan(false).await.unwrap();
+        assert!(!redundant_plan.contains("202601"), "{redundant_plan}");
+        let scalar_query = |plan: &str| {
+            plan.lines()
+                .find(|line| line.contains("ScalarIndexQuery:"))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(scalar_query(&narrow_plan), scalar_query(&redundant_plan));
+        let expected = narrow_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), rows);
+        assert_eq!(redundant_scan.try_into_batch().await.unwrap(), expected);
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(&redundant)
+            .unwrap();
+        assert_eq!(unindexed.try_into_batch().await.unwrap(), expected);
+    }
+
     #[tokio::test]
     async fn test_inexact_scalar_index_plans() {
         let data = gen_batch()

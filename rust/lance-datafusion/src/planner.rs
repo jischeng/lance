@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
+use crate::in_list::simplify_membership_regions;
 use crate::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
@@ -1126,6 +1127,9 @@ impl Planner {
         //
         // Running the rewrite more than once is safe because its output is a fixed
         // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
+        // Group compatible memberships before DataFusion shortens small IN lists
+        // to equality/OR expressions and loses their set structure.
+        let expr = simplify_membership_regions(expr, &|group| simplifier.simplify(group))?;
         let expr = simplifier.simplify(expr)?;
         let expr = rewrite_float_comparisons(expr, &df_schema)?;
 
@@ -1207,6 +1211,192 @@ mod tests {
             err.to_string().contains("Unsupported SQL value"),
             "error should name the unsupported value for {filter}, got {err}"
         );
+    }
+
+    #[rstest]
+    #[case::separated(
+        "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::reversed(
+        "s IN ('b','c') AND i = 1 AND s IN ('a','b','c','d')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::duplicate(
+        "s IN ('a','b','b') AND i = 1 AND s IN ('b','a')",
+        "i = 1 AND s IN ('a','b')"
+    )]
+    #[case::nullable(
+        "s IN ('a','b',NULL) AND i = 1 AND s IN ('b',NULL)",
+        "s IN ('a','b',NULL) AND i = 1 AND s IN ('b',NULL)"
+    )]
+    #[case::disjoint(
+        "s IN ('a','b') AND i = 1 AND s IN ('c','d')",
+        "i = 1 AND CASE WHEN s IS NULL THEN NULL ELSE false END"
+    )]
+    #[case::or_boundary(
+        "s IN ('a','b','c') AND (i = 1 OR s IN ('a','b'))",
+        "s IN ('a','b','c') AND (i = 1 OR s IN ('a','b'))"
+    )]
+    #[case::not_in(
+        "s NOT IN ('a','b','c') AND i = 1 AND s IN ('a','b')",
+        "i = 1 AND CASE WHEN s IS NULL THEN NULL ELSE false END"
+    )]
+    #[case::intersection("s IN ('a','b') AND i = 1 AND s IN ('b','c')", "i = 1 AND s = 'b'")]
+    #[case::difference(
+        "s IN ('a','b','c') AND i = 1 AND s NOT IN ('b','d')",
+        "i = 1 AND s IN ('a','c')"
+    )]
+    #[case::negative_union(
+        "s NOT IN ('a','b') AND i = 1 AND s NOT IN ('b','c')",
+        "i = 1 AND s NOT IN ('a','b','c')"
+    )]
+    #[case::three_memberships(
+        "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c','d') AND s NOT IN ('c','d')",
+        "i = 1 AND s = 'b'"
+    )]
+    #[case::equality("s = 'b' AND i = 1 AND s IN ('a','b','c')", "i = 1 AND s = 'b'")]
+    #[case::reversed_equality("'b' = s AND i = 1 AND s IN ('a','b','c')", "i = 1 AND s = 'b'")]
+    #[case::inequality(
+        "s IN ('a','b','c') AND i = 1 AND s <> 'b'",
+        "i = 1 AND s IN ('a','c')"
+    )]
+    #[case::folded_literal(
+        "s IN (concat('a', ''),'b','c') AND i = 1 AND s IN ('b','c')",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::right_nested(
+        "s IN ('a','b','c') AND (i = 1 AND s IN ('b','c'))",
+        "i = 1 AND s IN ('b','c')"
+    )]
+    #[case::separated_or(
+        "s IN ('a','b') OR i = 1 OR s IN ('b','c')",
+        "i = 1 OR s IN ('a','b','c')"
+    )]
+    #[case::coerced_integer("i IN (1,2,3) AND s = 'b' AND i IN (1,2)", "s = 'b' AND i IN (1,2)")]
+    #[case::two_columns(
+        "i IN (1,2,3) AND s IN ('a','b','c') AND i IN (1,2) AND s = 'b'",
+        "i IN (1,2) AND s = 'b'"
+    )]
+    #[case::positive_union("s IN ('a','b') OR s IN ('b','c')", "s IN ('a','b','c')")]
+    fn test_simplify_membership_regions(#[case] filter: &str, #[case] expected: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int64, true),
+        ]));
+        let planner = Planner::new(schema);
+        let original = planner.parse_filter(filter).unwrap();
+        let optimized = planner.optimize_expr(original.clone()).unwrap();
+        let expected = if expected.contains("CASE WHEN") {
+            col("i").eq(lit(1_i64)).and(
+                datafusion::logical_expr::when(col("s").is_null(), lit(ScalarValue::Boolean(None)))
+                    .otherwise(lit(false))
+                    .unwrap(),
+            )
+        } else {
+            planner.parse_filter(expected).unwrap()
+        };
+        let expected = planner.optimize_expr(expected).unwrap();
+        assert_eq!(optimized, expected);
+        let optimized_twice = planner.optimize_expr(optimized.clone()).unwrap();
+
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                [Some("a"), Some("b"), Some("c"), Some("d"), None, None]
+            ),
+            ("i", Int64, [Some(1), Some(1), Some(0), None, Some(1), None])
+        )
+        .unwrap();
+        let original = planner
+            .create_physical_expr(&original)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let optimized = planner
+            .create_physical_expr(&optimized)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let optimized_twice = planner
+            .create_physical_expr(&optimized_twice)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(original.as_ref(), optimized.as_ref());
+        assert_eq!(optimized.as_ref(), optimized_twice.as_ref());
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_membership_combinations(#[case] left_negated: bool, #[case] right_negated: bool) {
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                [Some("a"), Some("b"), Some("c"), Some("outside"), None]
+            ),
+            ("i", Int64, [1, 1, 1, 1, 1])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for left_set in 1..8 {
+            for right_set in 1..8 {
+                let membership = |set: usize, negated| {
+                    col("s").in_list(
+                        ["a", "b", "c"]
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(index, _)| set & (1 << index) != 0)
+                            .map(|(_, value)| lit(value))
+                            .collect(),
+                        negated,
+                    )
+                };
+                let left = membership(left_set, left_negated);
+                let right = membership(right_set, right_negated);
+                for original in [
+                    left.clone().and(col("i").eq(lit(1_i64))).and(right.clone()),
+                    right.clone().and(col("i").eq(lit(1_i64)).and(left.clone())),
+                    !left.clone().and(col("i").eq(lit(1_i64))).and(right.clone()),
+                    left.clone().or(col("i").eq(lit(0_i64))).or(right.clone()),
+                    right.clone().or(col("i").eq(lit(0_i64)).or(left.clone())),
+                    !left.or(col("i").eq(lit(0_i64))).or(right),
+                ] {
+                    let optimized = planner.optimize_expr(original.clone()).unwrap();
+                    let evaluate = |expr: &Expr| {
+                        planner
+                            .create_physical_expr(expr)
+                            .unwrap()
+                            .evaluate(&batch)
+                            .unwrap()
+                            .into_array(batch.num_rows())
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        evaluate(&original).as_ref(),
+                        evaluate(&optimized).as_ref(),
+                        "{original} => {optimized}"
+                    );
+                    let twice = planner.optimize_expr(optimized.clone()).unwrap();
+                    assert_eq!(
+                        evaluate(&optimized).as_ref(),
+                        evaluate(&twice).as_ref(),
+                        "{optimized} => {twice}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

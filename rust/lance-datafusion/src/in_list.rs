@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Expose separated membership predicates to DataFusion's set simplification rules.
+
+use std::collections::HashMap;
+
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, Result};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit, when};
+use datafusion::scalar::ScalarValue;
+
+pub fn simplify_membership_regions(
+    expr: Expr,
+    simplify: &impl Fn(Expr) -> Result<Expr>,
+) -> Result<Expr> {
+    let operator = match &expr {
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => binary.op,
+        _ => {
+            return expr
+                .map_children(|child| {
+                    simplify_membership_regions(child, simplify).map(Transformed::yes)
+                })
+                .map(|result| result.data);
+        }
+    };
+
+    // Visit a whole homogeneous region once. Postorder shape markers let us
+    // reconstruct its original parentheses without recursive descent through a
+    // potentially long AND/OR chain. Only boundary expressions recurse.
+    let mut pending = vec![Some(expr)];
+    let mut shape = Vec::new();
+    let mut terms = Vec::new();
+    while let Some(item) = pending.pop() {
+        match item {
+            Some(Expr::BinaryExpr(binary)) if binary.op == operator => {
+                pending.push(None);
+                pending.push(Some(*binary.right));
+                pending.push(Some(*binary.left));
+            }
+            Some(term) => {
+                terms.push(Some(simplify_membership_regions(term, simplify)?));
+                shape.push(false);
+            }
+            None => shape.push(true),
+        }
+    }
+
+    // Store positions rather than Expr keys: column hashing is cheap and has no
+    // interior mutability. Candidates never replace original terms until merged.
+    let mut groups: HashMap<Column, Vec<(usize, InList)>> = HashMap::new();
+    for (index, term) in terms.iter().enumerate() {
+        let mut list = match term.as_ref() {
+            Some(Expr::InList(list)) => list.clone(),
+            Some(Expr::BinaryExpr(binary))
+                if matches!(binary.op, Operator::Eq | Operator::NotEq) =>
+            {
+                let ((column @ Expr::Column(_), value) | (value, column @ Expr::Column(_))) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                else {
+                    continue;
+                };
+                InList::new(
+                    Box::new(column.clone()),
+                    vec![value.clone()],
+                    binary.op == Operator::NotEq,
+                )
+            }
+            _ => continue,
+        };
+        let Expr::Column(column) = list.expr.as_ref() else {
+            continue;
+        };
+        if list.list.is_empty() {
+            continue;
+        }
+        // Coercion can insert casts around constants. Fold operands without
+        // letting the simplifier expand the membership predicate itself.
+        for value in &mut list.list {
+            if !matches!(value, Expr::Literal(_, _)) {
+                *value = simplify(value.clone())?;
+            }
+        }
+        // Structural set operations do not model NULL elements or float equality.
+        if !list.list.iter().all(|item| {
+            matches!(item,
+            Expr::Literal(value, _) if !value.is_null() && !value.data_type().is_floating())
+        }) {
+            continue;
+        }
+        groups
+            .entry(column.clone())
+            .or_default()
+            .push((index, list));
+    }
+    for (column, candidates) in groups {
+        if candidates.len() < 2 {
+            continue;
+        }
+        let has_positive = candidates.iter().any(|(_, list)| !list.negated);
+        let has_negative = candidates.iter().any(|(_, list)| list.negated);
+        // DataFusion can lose UNKNOWN when folding complementary OR predicates.
+        if operator == Operator::Or && has_positive && has_negative {
+            continue;
+        }
+        let Some((last, _)) = candidates.last() else {
+            continue;
+        };
+        let last = *last;
+        let group = candidates
+            .iter()
+            .map(|(_, list)| Expr::InList(list.clone()))
+            .reduce(|left, right| {
+                Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+            });
+        let Some(group) = group else { continue };
+        let mut simplified = simplify(group)?;
+        // A constant empty intersection/difference still yields UNKNOWN for a
+        // NULL column. This planner also serves projections, not only filters.
+        if matches!(&simplified, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
+            simplified = when(
+                Expr::Column(column).is_null(),
+                lit(ScalarValue::Boolean(None)),
+            )
+            .otherwise(simplified)?;
+        }
+        for (index, _) in candidates {
+            terms[index] = None;
+        }
+        terms[last] = Some(simplified);
+    }
+
+    let mut terms = terms.into_iter();
+    let mut rebuilt = Vec::new();
+    for is_binary in shape {
+        if !is_binary {
+            rebuilt.push(terms.next().flatten());
+            continue;
+        }
+        let right = rebuilt.pop().flatten();
+        let left = rebuilt.pop().flatten();
+        rebuilt.push(match (left, right) {
+            (Some(left), Some(right)) => Some(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left),
+                operator,
+                Box::new(right),
+            ))),
+            (remaining, None) | (None, remaining) => remaining,
+        });
+    }
+    rebuilt.pop().flatten().ok_or_else(|| {
+        datafusion::common::internal_datafusion_err!(
+            "Membership simplification removed every region term"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{col, lit};
+    use std::cell::Cell;
+
+    #[test]
+    fn preserves_unmerged_regions_without_simplifier_calls() {
+        let mut level: Vec<_> = (0..1024).map(|i| col(format!("c{i}")).eq(lit(i))).collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| pair[0].clone().and(pair[1].clone()))
+                .collect();
+        }
+        let original = level.pop().unwrap();
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|expr| {
+            calls.set(calls.get() + 1);
+            Ok(expr)
+        })
+        .unwrap();
+        assert_eq!(rewritten, original);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn preserves_mixed_or_candidates() {
+        let original = col("s")
+            .eq(lit("a"))
+            .or(col("i").eq(lit(1)).or(col("s").not_eq(lit("b"))));
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|expr| {
+            calls.set(calls.get() + 1);
+            Ok(expr)
+        })
+        .unwrap();
+        assert_eq!(rewritten, original);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn simplifies_each_region_once() {
+        let original = col("s")
+            .in_list(vec![lit("a"), lit("b")], false)
+            .and(col("i").eq(lit(1)))
+            .and(col("s").in_list(vec![lit("b"), lit("c")], false));
+        let calls = Cell::new(0);
+        // Returning the group unchanged deliberately simulates a simplifier
+        // that cannot improve a candidate. The output must not be revisited.
+        simplify_membership_regions(original, &|expr| {
+            calls.set(calls.get() + 1);
+            Ok(expr)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+}
