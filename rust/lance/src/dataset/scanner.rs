@@ -16582,6 +16582,31 @@ mod test {
             .filter(&redundant)
             .unwrap();
         assert_eq!(unindexed.try_into_batch().await.unwrap(), expected);
+
+        // Empty intersections must keep their indexable predicates. Introducing
+        // a NULL guard adds residual filtering and disables an enclosing OR's
+        // index plan, even though every original predicate has an exact index.
+        let disjoint = "month IN ('202601') AND clip = 'other' AND month IN ('202602')";
+        for (filter, expected_rows) in [
+            (disjoint.to_string(), 0),
+            (
+                format!("({disjoint}) OR clip = '{clip}'"),
+                if clip == "target" { 4 } else { 0 },
+            ),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(&filter).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery:"), "{plan}");
+            assert!(plan.contains("[month = 202601]"), "{plan}");
+            assert!(plan.contains("[month = 202602]"), "{plan}");
+            assert!(plan.contains("refine_filter=--"), "{plan}");
+            let result = scan.try_into_batch().await.unwrap();
+            assert_eq!(result.num_rows(), expected_rows);
+            let mut unindexed = dataset.scan();
+            unindexed.use_scalar_index(false).filter(&filter).unwrap();
+            assert_eq!(unindexed.try_into_batch().await.unwrap(), result);
+        }
     }
 
     #[tokio::test]

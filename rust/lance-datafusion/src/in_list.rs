@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit, when};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
 pub fn simplify_membership_regions(
@@ -94,7 +94,7 @@ pub fn simplify_membership_regions(
             .or_default()
             .push((index, list));
     }
-    for (column, candidates) in groups {
+    for candidates in groups.into_values() {
         if candidates.len() < 2 {
             continue;
         }
@@ -108,22 +108,33 @@ pub fn simplify_membership_regions(
             continue;
         };
         let last = *last;
-        let group = candidates
+        // The simplifier recursively traverses its input. Keep the candidate
+        // tree balanced even when the original region contains many terms.
+        let mut level: Vec<_> = candidates
             .iter()
             .map(|(_, list)| Expr::InList(list.clone()))
-            .reduce(|left, right| {
-                Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
-            });
-        let Some(group) = group else { continue };
-        let mut simplified = simplify(group)?;
-        // A constant empty intersection/difference still yields UNKNOWN for a
-        // NULL column. This planner also serves projections, not only filters.
+            .collect();
+        while level.len() > 1 {
+            let mut parents = Vec::with_capacity(level.len().div_ceil(2));
+            let mut children = level.into_iter();
+            while let Some(left) = children.next() {
+                parents.push(match children.next() {
+                    Some(right) => {
+                        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+                    }
+                    None => left,
+                });
+            }
+            level = parents;
+        }
+        let Some(group) = level.pop() else { continue };
+        let simplified = simplify(group)?;
+        // A constant result loses UNKNOWN for a NULL column. A CASE guard
+        // preserves that result but introduces residual filtering, which can
+        // disable an enclosing OR's scalar index plan. Keep the original terms
+        // so both three-valued logic and index eligibility are preserved.
         if matches!(&simplified, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
-            simplified = when(
-                Expr::Column(column).is_null(),
-                lit(ScalarValue::Boolean(None)),
-            )
-            .otherwise(simplified)?;
+            continue;
         }
         for (index, _) in candidates {
             terms[index] = None;
@@ -195,6 +206,35 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten, original);
         assert_eq!(calls.get(), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::empty_intersection(Operator::And, false)]
+    #[case::empty_negated_intersection(Operator::Or, true)]
+    fn preserves_regions_when_simplification_is_constant(
+        #[case] operator: Operator,
+        #[case] negated: bool,
+    ) {
+        let first = col("s").in_list(vec![lit("a"), lit("b")], negated);
+        let middle = col("i").eq(lit(1));
+        let last = col("s").in_list(vec![lit("c"), lit("d")], negated);
+        let original = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(first),
+            operator,
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(middle),
+                operator,
+                Box::new(last),
+            ))),
+        ));
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|_| {
+            calls.set(calls.get() + 1);
+            Ok(lit(negated))
+        })
+        .unwrap();
+        assert_eq!(rewritten, original);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

@@ -1232,7 +1232,7 @@ mod tests {
     )]
     #[case::disjoint(
         "s IN ('a','b') AND i = 1 AND s IN ('c','d')",
-        "i = 1 AND CASE WHEN s IS NULL THEN NULL ELSE false END"
+        "s IN ('a','b') AND i = 1 AND s IN ('c','d')"
     )]
     #[case::or_boundary(
         "s IN ('a','b','c') AND (i = 1 OR s IN ('a','b'))",
@@ -1240,7 +1240,7 @@ mod tests {
     )]
     #[case::not_in(
         "s NOT IN ('a','b','c') AND i = 1 AND s IN ('a','b')",
-        "i = 1 AND CASE WHEN s IS NULL THEN NULL ELSE false END"
+        "s NOT IN ('a','b','c') AND i = 1 AND s IN ('a','b')"
     )]
     #[case::intersection("s IN ('a','b') AND i = 1 AND s IN ('b','c')", "i = 1 AND s = 'b'")]
     #[case::difference(
@@ -1287,15 +1287,7 @@ mod tests {
         let planner = Planner::new(schema);
         let original = planner.parse_filter(filter).unwrap();
         let optimized = planner.optimize_expr(original.clone()).unwrap();
-        let expected = if expected.contains("CASE WHEN") {
-            col("i").eq(lit(1_i64)).and(
-                datafusion::logical_expr::when(col("s").is_null(), lit(ScalarValue::Boolean(None)))
-                    .otherwise(lit(false))
-                    .unwrap(),
-            )
-        } else {
-            planner.parse_filter(expected).unwrap()
-        };
+        let expected = planner.parse_filter(expected).unwrap();
         let expected = planner.optimize_expr(expected).unwrap();
         assert_eq!(optimized, expected);
         let optimized_twice = planner.optimize_expr(optimized.clone()).unwrap();
@@ -1332,6 +1324,36 @@ mod tests {
             .unwrap();
         assert_eq!(original.as_ref(), optimized.as_ref());
         assert_eq!(optimized.as_ref(), optimized_twice.as_ref());
+    }
+
+    #[test]
+    fn test_many_same_column_memberships() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+        // An odd count also exercises unpaired terms while building each level.
+        let mut level: Vec<_> = (0..1025)
+            .map(|i| {
+                col("s").in_list(
+                    vec![lit("a"), lit("b"), lit("c"), lit(format!("v{i}"))],
+                    false,
+                )
+            })
+            .collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [left, right] => left.clone().and(right.clone()),
+                    [only] => only.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+        }
+        let optimized = planner.optimize_expr(level.pop().unwrap()).unwrap();
+        let expected = planner
+            .optimize_expr(col("s").in_list(vec![lit("a"), lit("b"), lit("c")], false))
+            .unwrap();
+        assert_eq!(optimized, expected);
     }
 
     #[rstest]
