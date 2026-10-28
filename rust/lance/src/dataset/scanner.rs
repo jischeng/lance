@@ -16607,6 +16607,21 @@ mod test {
             unindexed.use_scalar_index(false).filter(&filter).unwrap();
             assert_eq!(unindexed.try_into_batch().await.unwrap(), result);
         }
+
+        // Merging the repeated clip predicate must not expose the month
+        // contradiction to NULL-unsafe constant folding. In particular, NOT
+        // must not turn UNKNOWN into TRUE and admit the row with a NULL month.
+        let filter = "NOT (((month NOT IN ('202601') AND clip IN ('target')) \
+                      AND month IN ('202601')) AND clip IN ('target'))";
+        let mut reference_scan = dataset.scan();
+        reference_scan.filter("month IS NOT NULL").unwrap();
+        let expected = reference_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 5);
+        for use_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_index).filter(filter).unwrap();
+            assert_eq!(scan.try_into_batch().await.unwrap(), expected);
+        }
     }
 
     #[tokio::test]

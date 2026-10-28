@@ -1421,6 +1421,94 @@ mod tests {
         }
     }
 
+    #[rstest]
+    fn test_interleaved_membership_groups(
+        #[values(Operator::And, Operator::Or)] operator: Operator,
+        #[values(0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] negated: u8,
+        #[values(1_usize, 2, 3, 4, 5, 6, 7)] first_set: usize,
+    ) {
+        let values = [Some("a"), Some("b"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |expr: &Expr| {
+            planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+        let join = |left: Expr, right: Expr| {
+            Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+        };
+        let membership = |column: &str, set: usize, position: u8| {
+            col(column).in_list(
+                [lit("a"), lit("b"), lit(ScalarValue::Utf8(None))]
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| set & (1 << index) != 0)
+                    .map(|(_, value)| value)
+                    .collect(),
+                negated & (1 << position) != 0,
+            )
+        };
+        for b in 1..4 {
+            for c in 1..8 {
+                for d in 1..4 {
+                    let a = membership("s", first_set, 0);
+                    let b = membership("t", b, 1);
+                    let c = membership("s", c, 2);
+                    let d = membership("t", d, 3);
+                    // All five parenthesizations of four interleaved terms.
+                    // Moving either column's terms can expose the other's
+                    // predicates to the subsequent simplifier pass.
+                    for original in [
+                        join(join(join(a.clone(), b.clone()), c.clone()), d.clone()),
+                        join(join(a.clone(), join(b.clone(), c.clone())), d.clone()),
+                        join(a.clone(), join(join(b.clone(), c.clone()), d.clone())),
+                        join(a.clone(), join(b.clone(), join(c.clone(), d.clone()))),
+                        join(join(a, b), join(c, d)),
+                    ] {
+                        for original in [original.clone(), !original] {
+                            let expected = evaluate(&original);
+                            let optimized = planner.optimize_expr(original.clone()).unwrap();
+                            assert_eq!(
+                                evaluate(&optimized).as_ref(),
+                                expected.as_ref(),
+                                "{original:?} => {optimized:?}"
+                            );
+                            let twice = planner.optimize_expr(optimized.clone()).unwrap();
+                            assert_eq!(
+                                evaluate(&twice).as_ref(),
+                                expected.as_ref(),
+                                "{optimized:?} => {twice:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_filter_checks_is_valid_arity() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));

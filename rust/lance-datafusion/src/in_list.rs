@@ -59,7 +59,8 @@ pub fn simplify_membership_regions(
                 let ((column @ Expr::Column(_), value) | (value, column @ Expr::Column(_))) =
                     (binary.left.as_ref(), binary.right.as_ref())
                 else {
-                    continue;
+                    groups.clear();
+                    break;
                 };
                 InList::new(
                     Box::new(column.clone()),
@@ -70,10 +71,12 @@ pub fn simplify_membership_regions(
             _ => continue,
         };
         let Expr::Column(column) = list.expr.as_ref() else {
-            continue;
+            groups.clear();
+            break;
         };
         if list.list.is_empty() {
-            continue;
+            groups.clear();
+            break;
         }
         // Coercion can insert casts around constants. Fold operands without
         // letting the simplifier expand the membership predicate itself.
@@ -82,18 +85,25 @@ pub fn simplify_membership_regions(
                 *value = simplify(value.clone())?;
             }
         }
-        // Structural set operations do not model NULL elements or float equality.
+        // Ineligible memberships must retain their surrounding terms too:
+        // merging another column could make them adjacent and expose them to
+        // structural set operations that do not model NULLs or float equality.
         if !list.list.iter().all(|item| {
             matches!(item,
             Expr::Literal(value, _) if !value.is_null() && !value.data_type().is_floating())
         }) {
-            continue;
+            groups.clear();
+            break;
         }
         groups
             .entry(column.clone())
             .or_default()
             .push((index, list));
     }
+    // Removing another column's terms can expose a skipped group's predicates
+    // to unsafe folding in the subsequent simplifier pass. Stage all changes
+    // so a safety fallback preserves the entire region, regardless of group order.
+    let mut replacements = Vec::with_capacity(groups.len());
     for candidates in groups.into_values() {
         if candidates.len() < 2 {
             continue;
@@ -102,7 +112,8 @@ pub fn simplify_membership_regions(
         let has_negative = candidates.iter().any(|(_, list)| list.negated);
         // DataFusion can lose UNKNOWN when folding complementary OR predicates.
         if operator == Operator::Or && has_positive && has_negative {
-            continue;
+            replacements.clear();
+            break;
         }
         let Some((last, _)) = candidates.last() else {
             continue;
@@ -131,11 +142,15 @@ pub fn simplify_membership_regions(
         let simplified = simplify(group)?;
         // A constant result loses UNKNOWN for a NULL column. A CASE guard
         // preserves that result but introduces residual filtering, which can
-        // disable an enclosing OR's scalar index plan. Keep the original terms
+        // disable an enclosing OR's scalar index plan. Keep the whole region
         // so both three-valued logic and index eligibility are preserved.
         if matches!(&simplified, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
-            continue;
+            replacements.clear();
+            break;
         }
+        replacements.push((candidates, last, simplified));
+    }
+    for (candidates, last, simplified) in replacements {
         for (index, _) in candidates {
             terms[index] = None;
         }
@@ -197,15 +212,12 @@ mod tests {
     fn preserves_mixed_or_candidates() {
         let original = col("s")
             .eq(lit("a"))
-            .or(col("i").eq(lit(1)).or(col("s").not_eq(lit("b"))));
-        let calls = Cell::new(0);
-        let rewritten = simplify_membership_regions(original.clone(), &|expr| {
-            calls.set(calls.get() + 1);
-            Ok(expr)
-        })
-        .unwrap();
+            .or(col("i").eq(lit(1)))
+            .or(col("s").not_eq(lit("b")))
+            .or(col("i").eq(lit(1)));
+        let rewritten =
+            simplify_membership_regions(original.clone(), &|_| Ok(col("i").eq(lit(1)))).unwrap();
         assert_eq!(rewritten, original);
-        assert_eq!(calls.get(), 0);
     }
 
     #[rstest::rstest]
@@ -235,6 +247,29 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten, original);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn discards_staged_merges_when_another_group_needs_fallback() {
+        let original = col("s")
+            .eq(lit("a"))
+            .and(col("t").eq(lit("a")))
+            .and(col("s").not_eq(lit("a")))
+            .and(col("t").eq(lit("a")));
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|expr| {
+            calls.set(calls.get() + 1);
+            // Force a successful merge before the unsafe result, independent
+            // of HashMap iteration order.
+            if calls.get() == 1 {
+                Ok(expr)
+            } else {
+                Ok(lit(false))
+            }
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(rewritten, original);
     }
 
     #[test]
