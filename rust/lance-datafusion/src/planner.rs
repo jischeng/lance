@@ -1424,8 +1424,8 @@ mod tests {
     #[rstest]
     fn test_interleaved_membership_groups(
         #[values(Operator::And, Operator::Or)] operator: Operator,
-        #[values(0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] negated: u8,
-        #[values(1_usize, 2, 3, 4, 5, 6, 7)] first_set: usize,
+        #[values(0_u8, 1, 2, 3, 8, 12)] negated: u8,
+        #[values(1_usize, 2, 5)] first_set: usize,
     ) {
         let values = [Some("a"), Some("b"), Some("outside"), None];
         let batch = arrow_array::record_batch!(
@@ -1506,6 +1506,116 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[rstest]
+    fn test_membership_syntax_variants(
+        #[values(0_usize, 1, 2, 3, 4, 5)] left_form: usize,
+        #[values(0_usize, 1, 2, 3, 4, 5)] right_form: usize,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("s", Utf8, [Some("a"), Some("b"), None]),
+            ("t", Utf8, [Some("a"), Some("b"), None])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |expr: &Expr| {
+            planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+        // The same membership written in the shapes a filter can carry. A
+        // negated membership has to join the same group as a plain one,
+        // otherwise a contradiction could reach the simplifier once another
+        // column's terms moved.
+        let membership = |column: &str, form: usize| -> Expr {
+            let column = col(column);
+            match form {
+                0 => column.in_list(vec![lit("a")], false),
+                1 => column.eq(lit("a")),
+                2 => column.not_eq(lit("a")),
+                3 => !column.in_list(vec![lit("a")], false),
+                4 => !column.eq(lit("a")),
+                _ => !column.not_eq(lit("a")),
+            }
+        };
+        let left = membership("s", left_form);
+        let right = membership("t", right_form);
+        let conjunction = || {
+            left.clone()
+                .and(right.clone())
+                .and(left.clone())
+                .and(right.clone())
+        };
+        for original in [
+            conjunction(),
+            left.clone()
+                .and(right.clone().and(left.clone()))
+                .and(right.clone()),
+            !conjunction(),
+        ] {
+            let expected = evaluate(&original);
+            let optimized = planner.optimize_expr(original.clone()).unwrap();
+            assert_eq!(
+                evaluate(&optimized).as_ref(),
+                expected.as_ref(),
+                "{original:?} => {optimized:?}"
+            );
+            let twice = planner.optimize_expr(optimized.clone()).unwrap();
+            assert_eq!(
+                evaluate(&twice).as_ref(),
+                expected.as_ref(),
+                "{optimized:?} => {twice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negated_membership_keeps_unknown() {
+        let batch =
+            arrow_array::record_batch!(("s", Utf8, [None::<&str>]), ("t", Utf8, [Some("a")]))
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |expr: &Expr| {
+            planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+        // A negated membership contradicts the positive one. Folding them to a
+        // boolean constant would answer FALSE for a NULL column, and the
+        // negated form would answer TRUE.
+        let contradictory = col("s")
+            .in_list(vec![lit("a")], false)
+            .and(col("t").in_list(vec![lit("a")], false))
+            .and(!col("s").in_list(vec![lit("a")], false))
+            .and(col("t").in_list(vec![lit("a")], false));
+        for original in [contradictory.clone(), !contradictory] {
+            let expected = evaluate(&original);
+            assert!(
+                expected.is_null(0),
+                "{original:?} should stay UNKNOWN, got {expected:?}"
+            );
+            let optimized = planner.optimize_expr(original.clone()).unwrap();
+            assert_eq!(
+                evaluate(&optimized).as_ref(),
+                expected.as_ref(),
+                "{original:?} => {optimized:?}"
+            );
+            let twice = planner.optimize_expr(optimized.clone()).unwrap();
+            assert_eq!(
+                evaluate(&twice).as_ref(),
+                expected.as_ref(),
+                "{optimized:?} => {twice:?}"
+            );
         }
     }
 

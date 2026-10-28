@@ -5,26 +5,60 @@
 
 use std::collections::HashMap;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
+/// How a term of a homogeneous region takes part in the simplification.
+enum Term {
+    /// A membership that structural set algebra can model.
+    Candidate(InList),
+    /// A term that DataFusion can still merge with another membership, but
+    /// that structural set algebra cannot model. The region is preserved.
+    Ineligible,
+    /// A term that cannot become a membership. Another column may merge while
+    /// this term stays in place.
+    Opaque,
+}
+
+/// Simplify the membership predicates of every homogeneous region in `expr`.
+///
+/// DataFusion only combines two `IN` expressions when they are direct
+/// children of the same `AND` node. This groups the separated ones and hands
+/// them to the existing set simplification rules.
 pub fn simplify_membership_regions(
     expr: Expr,
     simplify: &impl Fn(Expr) -> Result<Expr>,
 ) -> Result<Expr> {
+    Ok(simplify_region(expr, simplify)?.0)
+}
+
+/// Rewrites a region and reports whether the result differs from the input.
+fn simplify_region(expr: Expr, simplify: &impl Fn(Expr) -> Result<Expr>) -> Result<(Expr, bool)> {
     let operator = match &expr {
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => binary.op,
         _ => {
-            return expr
+            let mut changed = false;
+            let expr = expr
                 .map_children(|child| {
-                    simplify_membership_regions(child, simplify).map(Transformed::yes)
-                })
-                .map(|result| result.data);
+                    simplify_region(child, simplify).map(|(child, child_changed)| {
+                        changed |= child_changed;
+                        Transformed::yes(child)
+                    })
+                })?
+                .data;
+            return Ok((expr, changed));
         }
     };
+
+    // A filter without two memberships of the same column has nothing to
+    // group. Keeping the expression avoids rebuilding the tree of every
+    // filter.
+    if !has_mergeable_group(&expr, simplify)? {
+        return Ok((expr, false));
+    }
 
     // Visit a whole homogeneous region once. Postorder shape markers let us
     // reconstruct its original parentheses without recursive descent through a
@@ -32,6 +66,7 @@ pub fn simplify_membership_regions(
     let mut pending = vec![Some(expr)];
     let mut shape = Vec::new();
     let mut terms = Vec::new();
+    let mut changed = false;
     while let Some(item) = pending.pop() {
         match item {
             Some(Expr::BinaryExpr(binary)) if binary.op == operator => {
@@ -40,7 +75,9 @@ pub fn simplify_membership_regions(
                 pending.push(Some(*binary.left));
             }
             Some(term) => {
-                terms.push(Some(simplify_membership_regions(term, simplify)?));
+                let (term, term_changed) = simplify_region(term, simplify)?;
+                changed |= term_changed;
+                terms.push(Some(term));
                 shape.push(false);
             }
             None => shape.push(true),
@@ -50,111 +87,90 @@ pub fn simplify_membership_regions(
     // Store positions rather than Expr keys: column hashing is cheap and has no
     // interior mutability. Candidates never replace original terms until merged.
     let mut groups: HashMap<Column, Vec<(usize, InList)>> = HashMap::new();
+    let mut blocked = false;
     for (index, term) in terms.iter().enumerate() {
-        let mut list = match term.as_ref() {
-            Some(Expr::InList(list)) => list.clone(),
-            Some(Expr::BinaryExpr(binary))
-                if matches!(binary.op, Operator::Eq | Operator::NotEq) =>
-            {
-                let ((column @ Expr::Column(_), value) | (value, column @ Expr::Column(_))) =
-                    (binary.left.as_ref(), binary.right.as_ref())
-                else {
-                    groups.clear();
+        let Some(term) = term.as_ref() else { continue };
+        match classify_term(term, simplify)? {
+            Term::Opaque => continue,
+            Term::Ineligible => {
+                blocked = true;
+                break;
+            }
+            Term::Candidate(list) => {
+                let Expr::Column(column) = list.expr.as_ref() else {
+                    blocked = true;
                     break;
                 };
-                InList::new(
-                    Box::new(column.clone()),
-                    vec![value.clone()],
-                    binary.op == Operator::NotEq,
-                )
-            }
-            _ => continue,
-        };
-        let Expr::Column(column) = list.expr.as_ref() else {
-            groups.clear();
-            break;
-        };
-        if list.list.is_empty() {
-            groups.clear();
-            break;
-        }
-        // Coercion can insert casts around constants. Fold operands without
-        // letting the simplifier expand the membership predicate itself.
-        for value in &mut list.list {
-            if !matches!(value, Expr::Literal(_, _)) {
-                *value = simplify(value.clone())?;
+                groups
+                    .entry(column.clone())
+                    .or_default()
+                    .push((index, list));
             }
         }
-        // Ineligible memberships must retain their surrounding terms too:
-        // merging another column could make them adjacent and expose them to
-        // structural set operations that do not model NULLs or float equality.
-        if !list.list.iter().all(|item| {
-            matches!(item,
-            Expr::Literal(value, _) if !value.is_null() && !value.data_type().is_floating())
-        }) {
-            groups.clear();
-            break;
-        }
-        groups
-            .entry(column.clone())
-            .or_default()
-            .push((index, list));
     }
+
     // Removing another column's terms can expose a skipped group's predicates
     // to unsafe folding in the subsequent simplifier pass. Stage all changes
     // so a safety fallback preserves the entire region, regardless of group order.
     let mut replacements = Vec::with_capacity(groups.len());
-    for candidates in groups.into_values() {
-        if candidates.len() < 2 {
-            continue;
-        }
-        let has_positive = candidates.iter().any(|(_, list)| !list.negated);
-        let has_negative = candidates.iter().any(|(_, list)| list.negated);
-        // DataFusion can lose UNKNOWN when folding complementary OR predicates.
-        if operator == Operator::Or && has_positive && has_negative {
-            replacements.clear();
-            break;
-        }
-        let Some((last, _)) = candidates.last() else {
-            continue;
-        };
-        let last = *last;
-        // The simplifier recursively traverses its input. Keep the candidate
-        // tree balanced even when the original region contains many terms.
-        let mut level: Vec<_> = candidates
-            .iter()
-            .map(|(_, list)| Expr::InList(list.clone()))
-            .collect();
-        while level.len() > 1 {
-            let mut parents = Vec::with_capacity(level.len().div_ceil(2));
-            let mut children = level.into_iter();
-            while let Some(left) = children.next() {
-                parents.push(match children.next() {
-                    Some(right) => {
-                        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
-                    }
-                    None => left,
-                });
+    if !blocked {
+        for candidates in groups.into_values() {
+            if candidates.len() < 2 {
+                continue;
             }
-            level = parents;
+            let has_positive = candidates.iter().any(|(_, list)| !list.negated);
+            let has_negative = candidates.iter().any(|(_, list)| list.negated);
+            // DataFusion can lose UNKNOWN when folding complementary OR predicates.
+            if operator == Operator::Or && has_positive && has_negative {
+                blocked = true;
+                break;
+            }
+            let Some((last, _)) = candidates.last() else {
+                continue;
+            };
+            let last = *last;
+            // The simplifier recursively traverses its input. Keep the candidate
+            // tree balanced even when the original region contains many terms.
+            let mut level: Vec<_> = candidates
+                .iter()
+                .map(|(_, list)| Expr::InList(list.clone()))
+                .collect();
+            while level.len() > 1 {
+                let mut parents = Vec::with_capacity(level.len().div_ceil(2));
+                let mut children = level.into_iter();
+                while let Some(left) = children.next() {
+                    parents.push(match children.next() {
+                        Some(right) => Expr::BinaryExpr(BinaryExpr::new(
+                            Box::new(left),
+                            operator,
+                            Box::new(right),
+                        )),
+                        None => left,
+                    });
+                }
+                level = parents;
+            }
+            let Some(group) = level.pop() else { continue };
+            let simplified = simplify(group)?;
+            // A constant result loses UNKNOWN for a NULL column. A CASE guard
+            // preserves that result but introduces residual filtering, which can
+            // disable an enclosing OR's scalar index plan. Keep the whole region
+            // so both three-valued logic and index eligibility are preserved.
+            if matches!(&simplified, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
+                blocked = true;
+                break;
+            }
+            replacements.push((candidates, last, simplified));
         }
-        let Some(group) = level.pop() else { continue };
-        let simplified = simplify(group)?;
-        // A constant result loses UNKNOWN for a NULL column. A CASE guard
-        // preserves that result but introduces residual filtering, which can
-        // disable an enclosing OR's scalar index plan. Keep the whole region
-        // so both three-valued logic and index eligibility are preserved.
-        if matches!(&simplified, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
-            replacements.clear();
-            break;
-        }
-        replacements.push((candidates, last, simplified));
     }
-    for (candidates, last, simplified) in replacements {
-        for (index, _) in candidates {
-            terms[index] = None;
+    if !blocked {
+        for (candidates, last, simplified) in replacements {
+            for (index, _) in candidates {
+                terms[index] = None;
+            }
+            terms[last] = Some(simplified);
+            changed = true;
         }
-        terms[last] = Some(simplified);
     }
 
     let mut terms = terms.into_iter();
@@ -175,11 +191,121 @@ pub fn simplify_membership_regions(
             (remaining, None) | (None, remaining) => remaining,
         });
     }
-    rebuilt.pop().flatten().ok_or_else(|| {
+    let rebuilt = rebuilt.pop().flatten().ok_or_else(|| {
         datafusion::common::internal_datafusion_err!(
             "Membership simplification removed every region term"
         )
-    })
+    })?;
+    Ok((rebuilt, changed))
+}
+
+/// Whether the expression holds a column with more than one membership.
+///
+/// Only such a column can form a group. The count spans the whole expression,
+/// which is enough to rule out a group and never rules out a real one.
+fn has_mergeable_group(expr: &Expr, simplify: &impl Fn(Expr) -> Result<Expr>) -> Result<bool> {
+    let mut counts: HashMap<Column, usize> = HashMap::new();
+    let mut mergeable = false;
+    expr.apply(&mut |node: &Expr| {
+        if let Term::Candidate(list) = classify_term(node, simplify)?
+            && let Expr::Column(column) = list.expr.as_ref()
+        {
+            let count = counts.entry(column.clone()).or_insert(0);
+            *count += 1;
+            if *count >= 2 {
+                mergeable = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(match node {
+            // A negation is counted through itself, so the membership it
+            // wraps must not be counted again.
+            Expr::Not(_) => TreeNodeRecursion::Jump,
+            _ => TreeNodeRecursion::Continue,
+        })
+    })?;
+    Ok(mergeable)
+}
+
+/// Classifies a term of a homogeneous region.
+fn classify_term(term: &Expr, simplify: &impl Fn(Expr) -> Result<Expr>) -> Result<Term> {
+    match term {
+        // A negated membership is still a membership. DataFusion rewrites
+        // `NOT (x IN (..))` into `x NOT IN (..)`, so the group has to see the
+        // same shape, otherwise a contradiction could reach the simplifier
+        // after another column's terms moved.
+        Expr::Not(inner) => match classify_term(inner.as_ref(), simplify)? {
+            Term::Candidate(list) => Ok(Term::Candidate(InList {
+                expr: list.expr,
+                list: list.list,
+                negated: !list.negated,
+            })),
+            // A negated conjunction expands into memberships once DataFusion
+            // distributes the negation.
+            Term::Ineligible => Ok(Term::Ineligible),
+            Term::Opaque => Ok(Term::Ineligible),
+        },
+        Expr::InList(list) => {
+            let mut list = list.clone();
+            // Coercion can insert casts around constants. Fold operands without
+            // letting the simplifier expand the membership predicate itself.
+            for value in &mut list.list {
+                if !matches!(value, Expr::Literal(_, _)) {
+                    *value = simplify(value.clone())?;
+                }
+            }
+            if is_eligible(&list) {
+                Ok(Term::Candidate(list))
+            } else {
+                Ok(Term::Ineligible)
+            }
+        }
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq | Operator::NotEq) => {
+            let ((column @ Expr::Column(_), value) | (value, column @ Expr::Column(_))) =
+                (binary.left.as_ref(), binary.right.as_ref())
+            else {
+                // A comparison between two expressions is not a membership, and
+                // DataFusion only turns a column compared with a literal into
+                // one.
+                return Ok(Term::Opaque);
+            };
+            if matches!(value, Expr::Literal(_, _)) {
+                let list = InList::new(
+                    Box::new(column.clone()),
+                    vec![value.clone()],
+                    binary.op == Operator::NotEq,
+                );
+                return Ok(if is_eligible(&list) {
+                    Term::Candidate(list)
+                } else {
+                    Term::Ineligible
+                });
+            }
+            if matches!(value, Expr::Column(_)) {
+                // A column never folds into a literal, so the comparison stays
+                // a comparison and cannot join a membership group.
+                return Ok(Term::Opaque);
+            }
+            // Any other operand may fold into a literal and become a
+            // membership later.
+            Ok(Term::Ineligible)
+        }
+        _ => Ok(Term::Opaque),
+    }
+}
+
+/// Whether structural set algebra can model a membership.
+///
+/// Set operations on a nullable column do not follow ordinary structural
+/// algebra, and floating point equality follows Arrow's total order rather
+/// than IEEE 754.
+fn is_eligible(list: &InList) -> bool {
+    matches!(list.expr.as_ref(), Expr::Column(_))
+        && !list.list.is_empty()
+        && list.list.iter().all(|item| {
+            matches!(item,
+            Expr::Literal(value, _) if !value.is_null() && !value.data_type().is_floating())
+        })
 }
 
 #[cfg(test)]
@@ -270,6 +396,24 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 2);
         assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn keeps_regions_with_a_comparison_between_columns() {
+        // A comparison between two columns cannot become a membership, so it
+        // must not stop the other column from merging.
+        let original = col("s")
+            .in_list(vec![lit("a"), lit("b")], false)
+            .and(col("t").eq(col("u")))
+            .and(col("s").in_list(vec![lit("b"), lit("c")], false));
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|expr| {
+            calls.set(calls.get() + 1);
+            Ok(expr)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_ne!(rewritten, original);
     }
 
     #[test]
