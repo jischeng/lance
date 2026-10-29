@@ -1242,6 +1242,24 @@ mod tests {
         optimized
     }
 
+    #[test]
+    #[ignore = "DataFusion 55.2 NULL folding: https://github.com/apache/datafusion/issues/24246"]
+    fn test_adjacent_disjoint_memberships_keep_unknown() {
+        // Also fails with the membership grouping pass disabled. Enable this
+        // regression when the upstream fix (#24258) reaches our dependency.
+        let batch =
+            arrow_array::record_batch!(("month", Utf8, [None, Some("202601"), Some("outside")]))
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .parse_filter(
+                "NOT (month IN ('202601','202602','202603','202604') \
+             AND month IN ('202605','202606','202607','202608'))",
+            )
+            .unwrap();
+        assert_optimization_preserves_values(&planner, &batch, expr);
+    }
+
     #[rstest]
     #[case::separated(
         "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c')",
@@ -1319,6 +1337,22 @@ mod tests {
     #[case::not_boolean(
         "s IN ('a','b','c') AND NOT b AND s IN ('b','c')",
         "NOT b AND s IN ('b','c')"
+    )]
+    #[case::not_greater_than(
+        "s IN ('a','b','c') AND NOT (i > 100) AND s IN ('b')",
+        "NOT (i > 100) AND s = 'b'"
+    )]
+    #[case::not_less_equal(
+        "s IN ('a','b','c') AND NOT (i <= 0) AND s IN ('b')",
+        "NOT (i <= 0) AND s = 'b'"
+    )]
+    #[case::not_reversed_comparison(
+        "s IN ('a','b','c') AND NOT (100 < i) AND s IN ('b')",
+        "NOT (100 < i) AND s = 'b'"
+    )]
+    #[case::not_double_comparison(
+        "s IN ('a','b','c') AND NOT NOT (i >= 0) AND s IN ('b')",
+        "i >= 0 AND s = 'b'"
     )]
     #[case::not_is_null(
         "s IN ('a','b','c') AND NOT (i IS NULL) AND s IN ('b','c')",

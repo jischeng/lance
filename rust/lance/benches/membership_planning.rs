@@ -68,6 +68,29 @@ fn membership_planning(c: &mut Criterion) {
             });
         }
     }
+    for count in [32, 128, 1024] {
+        let mut level: Vec<_> = (0..count)
+            .map(|i| (col("c0") + lit(i as i64)).in_list(vec![lit(1_i64)], false))
+            .collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| pair[0].clone().and(pair[1].clone()))
+                .collect();
+        }
+        let expr = level.pop().unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("computed_memberships", count),
+            &expr,
+            |b, expr| {
+                b.iter_batched(
+                    || expr.clone(),
+                    |expr| black_box(planner.optimize_expr(expr).unwrap()),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
     group.finish();
 }
 

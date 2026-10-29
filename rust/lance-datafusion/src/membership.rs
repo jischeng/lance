@@ -12,6 +12,10 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
+// Computed memberships are never merged. Bound their structural comparisons
+// so generated filters cannot turn this safety check into quadratic work.
+const MAX_COMPUTED_MEMBERSHIPS: usize = 32;
+
 /// A borrowed membership, including equality and explicit NOT spellings.
 struct Membership<'a> {
     expr: &'a Expr,
@@ -105,11 +109,11 @@ fn plan_replacements(
     operator: Operator,
     simplify: &impl Fn(Expr) -> Result<Expr>,
 ) -> Result<Vec<(Vec<usize>, Expr)>> {
-    // Column lookup is constant-time. Computed expressions are uncommon and
-    // compared directly, without hashing Expr values that can contain UDFs.
+    // Column lookup is constant-time. Keep only a bounded list of computed
+    // expressions to detect unsafe repeats without hashing Exprs containing UDFs.
     let mut columns: HashMap<&Column, usize> = HashMap::new();
     let mut groups: Vec<Vec<(usize, Membership<'_>)>> = Vec::new();
-    let mut computed_groups = Vec::new();
+    let mut computed: Vec<&Expr> = Vec::new();
     for (index, term) in terms.iter().enumerate() {
         let membership = match classify_term(term) {
             Term::Membership(membership) => membership,
@@ -121,16 +125,12 @@ fn plan_replacements(
                 groups.push(Vec::new());
                 groups.len() - 1
             })
-        } else if let Some(&group_index) = computed_groups.iter().find(|&&group_index| {
-            let group: &Vec<(usize, Membership<'_>)> = &groups[group_index];
-            group[0].1.expr == membership.expr
-        }) {
-            group_index
         } else {
-            let group_index = groups.len();
-            computed_groups.push(group_index);
-            groups.push(Vec::new());
-            group_index
+            if computed.len() == MAX_COMPUTED_MEMBERSHIPS || computed.contains(&membership.expr) {
+                return Ok(Vec::new());
+            }
+            computed.push(membership.expr);
+            continue;
         };
         groups[group_index].push((index, membership));
     }
@@ -142,17 +142,23 @@ fn plan_replacements(
         }
         let has_positive = group.iter().any(|(_, membership)| !membership.negated);
         let has_negative = group.iter().any(|(_, membership)| membership.negated);
-        if !matches!(group[0].1.expr, Expr::Column(_))
-            || (operator == Operator::Or && has_positive && has_negative)
-        {
+        if operator == Operator::Or && has_positive && has_negative {
+            return Ok(Vec::new());
+        }
+        // Reject known-ineligible operands across the whole group before
+        // cloning even its first list or folding non-literal operands.
+        if group.iter().any(|(_, membership)| {
+            membership.values.is_empty()
+                || membership.values.iter().any(|value| {
+                    matches!(value, Expr::Literal(value, _)
+                        if value.is_null() || value.data_type().is_floating())
+                })
+        }) {
             return Ok(Vec::new());
         }
         let mut indices = Vec::with_capacity(group.len());
         let mut level = Vec::with_capacity(group.len());
         for (index, membership) in group {
-            if membership.values.is_empty() {
-                return Ok(Vec::new());
-            }
             // Clone operands only after a repeated column is found. Fold casts
             // on constants without expanding the membership predicate itself.
             let values = membership
@@ -233,6 +239,19 @@ fn classify_term(mut term: &Expr) -> Term<'_> {
                 values: std::slice::from_ref(value),
                 negated: negated ^ (binary.op == Operator::NotEq),
             })
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+            ) && matches!((binary.left.as_ref(), binary.right.as_ref()),
+                    (Expr::Column(_), Expr::Literal(value, _))
+                    | (Expr::Literal(value, _), Expr::Column(_))
+                    if !value.is_null() && !matches!(value, ScalarValue::Boolean(_))) =>
+        {
+            // Negation only flips an ordinary ordering comparison's operator;
+            // it cannot expose IN/Eq predicates or distribute a boolean region.
+            Term::Other
         }
         Expr::BinaryExpr(binary)
             if negated && matches!(binary.op, Operator::And | Operator::Or) =>
@@ -374,6 +393,57 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rewritten, original);
+    }
+
+    #[rstest::rstest]
+    #[case::float(lit(1.0))]
+    #[case::null(lit(ScalarValue::Int32(None)))]
+    fn rejects_known_ineligible_literals_before_folding(#[case] ineligible: Expr) {
+        let original = col("f")
+            .in_list(vec![col("other")], false)
+            .and(col("f").in_list(vec![ineligible], false));
+        let rewritten = simplify_membership_regions(original.clone(), &|_| {
+            panic!("Known-ineligible literals must reject the group before operand folding")
+        })
+        .unwrap();
+        assert_eq!(rewritten, original);
+    }
+
+    #[rstest::rstest]
+    #[case::bounded(MAX_COMPUTED_MEMBERSHIPS, true)]
+    #[case::over_limit(MAX_COMPUTED_MEMBERSHIPS + 1, false)]
+    #[case::large(1024, false)]
+    fn bounds_computed_membership_detection(#[case] count: usize, #[case] merges: bool) {
+        let mut level: Vec<_> = (0..count)
+            .map(|i| (col(format!("c{i}")) + lit(1)).in_list(vec![lit(2)], false))
+            .collect();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut terms = level.into_iter();
+            while let Some(left) = terms.next() {
+                next.push(match terms.next() {
+                    Some(right) => left.and(right),
+                    None => left,
+                });
+            }
+            level = next;
+        }
+        let original = col("s")
+            .in_list(vec![lit("a"), lit("b")], false)
+            .and(level.pop().unwrap())
+            .and(col("s").in_list(vec![lit("b")], false));
+        let calls = Cell::new(0);
+        let rewritten = simplify_membership_regions(original.clone(), &|_| {
+            calls.set(calls.get() + 1);
+            Ok(col("s").eq(lit("b")))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), usize::from(merges));
+        if merges {
+            assert_ne!(rewritten, original);
+        } else {
+            assert_eq!(rewritten, original);
+        }
     }
 
     #[test]
