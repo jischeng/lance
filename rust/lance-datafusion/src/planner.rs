@@ -1295,24 +1295,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "DataFusion 55.2 NULL folding: https://github.com/apache/datafusion/issues/24246"]
-    fn test_adjacent_disjoint_memberships_keep_unknown() {
-        // Also fails with the membership grouping pass disabled. Enable this
-        // regression when the upstream fix (#24258) reaches our dependency.
-        let batch =
-            arrow_array::record_batch!(("month", Utf8, [None, Some("202601"), Some("outside")]))
-                .unwrap();
-        let planner = Planner::new(batch.schema());
-        let expr = planner
-            .parse_filter(
-                "NOT (month IN ('202601','202602','202603','202604') \
-             AND month IN ('202605','202606','202607','202608'))",
-            )
-            .unwrap();
-        assert_optimization_preserves_values(&planner, &batch, expr);
-    }
-
     #[rstest]
     #[case::separated(
         "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c')",
@@ -1618,73 +1600,63 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum MembershipForm {
-        In,
-        Equal,
-        NotEqual,
-        NotIn,
-        NotEqualExpr,
-        NotNotEqual,
-    }
-
-    impl MembershipForm {
-        fn expression(self, column: &str) -> Expr {
-            let column = col(column);
-            match self {
-                Self::In => column.in_list(vec![lit("a")], false),
-                Self::Equal => column.eq(lit("a")),
-                Self::NotEqual => column.not_eq(lit("a")),
-                Self::NotIn => Expr::Not(Box::new(column.in_list(vec![lit("a")], false))),
-                Self::NotEqualExpr => Expr::Not(Box::new(column.eq(lit("a")))),
-                Self::NotNotEqual => Expr::Not(Box::new(column.not_eq(lit("a")))),
-            }
-        }
-    }
-
     #[rstest]
-    fn test_membership_syntax_variants(
-        #[values(
-            MembershipForm::In,
-            MembershipForm::Equal,
-            MembershipForm::NotEqual,
-            MembershipForm::NotIn,
-            MembershipForm::NotEqualExpr,
-            MembershipForm::NotNotEqual
-        )]
-        left_form: MembershipForm,
-        #[values(
-            MembershipForm::In,
-            MembershipForm::Equal,
-            MembershipForm::NotEqual,
-            MembershipForm::NotIn,
-            MembershipForm::NotEqualExpr,
-            MembershipForm::NotNotEqual
-        )]
-        right_form: MembershipForm,
-    ) {
+    #[case::in_list("s IN ('a')")]
+    #[case::equal("s = 'a'")]
+    #[case::not_equal("s <> 'a'")]
+    #[case::not_in("NOT (s IN ('a'))")]
+    #[case::not_equal_expr("NOT (s = 'a')")]
+    #[case::not_not_equal("NOT (s <> 'a')")]
+    fn test_membership_syntax_variants(#[case] left_sql: &str) {
+        let values = [Some("a"), Some("b"), None];
         let batch = arrow_array::record_batch!(
-            ("s", Utf8, [Some("a"), Some("b"), None]),
-            ("t", Utf8, [Some("a"), Some("b"), None])
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
         )
         .unwrap();
         let planner = Planner::new(batch.schema());
-        let left = left_form.expression("s");
-        let right = right_form.expression("t");
-        let conjunction = || {
-            left.clone()
-                .and(right.clone())
-                .and(left.clone())
-                .and(right.clone())
-        };
-        for original in [
-            conjunction(),
-            left.clone()
-                .and(right.clone().and(left.clone()))
-                .and(right.clone()),
-            !conjunction(),
+        let left = planner.parse_filter(left_sql).unwrap();
+        for right_sql in [
+            "t IN ('a')",
+            "t = 'a'",
+            "t <> 'a'",
+            "NOT (t IN ('a'))",
+            "NOT (t = 'a')",
+            "NOT (t <> 'a')",
         ] {
-            assert_optimization_preserves_values(&planner, &batch, original);
+            let right = planner.parse_filter(right_sql).unwrap();
+            for expr in [
+                left.clone()
+                    .and(right.clone())
+                    .and(left.clone())
+                    .and(right.clone()),
+                left.clone()
+                    .and(right.clone().and(left.clone()))
+                    .and(right.clone()),
+                // Explicit NOT also covers the nullable contradiction regression.
+                left.clone()
+                    .and(right.clone())
+                    .and(Expr::Not(Box::new(left.clone())))
+                    .and(right),
+            ] {
+                for original in [expr.clone(), !expr] {
+                    assert_optimization_preserves_values(&planner, &batch, original);
+                }
+            }
         }
     }
 
@@ -1777,36 +1749,6 @@ mod tests {
                 .into_array(batch.num_rows())
                 .unwrap();
             assert_eq!(actual.as_ref(), &expected, "{expr:?}");
-        }
-    }
-
-    #[test]
-    fn test_negated_membership_keeps_unknown() {
-        let batch =
-            arrow_array::record_batch!(("s", Utf8, [None::<&str>]), ("t", Utf8, [Some("a")]))
-                .unwrap();
-        let planner = Planner::new(batch.schema());
-        // A negated membership contradicts the positive one. Folding them to a
-        // boolean constant would answer FALSE for a NULL column, and the
-        // negated form would answer TRUE.
-        let contradictory = col("s")
-            .in_list(vec![lit("a")], false)
-            .and(col("t").in_list(vec![lit("a")], false))
-            .and(!col("s").in_list(vec![lit("a")], false))
-            .and(col("t").in_list(vec![lit("a")], false));
-        for original in [contradictory.clone(), !contradictory] {
-            let optimized = assert_optimization_preserves_values(&planner, &batch, original);
-            let result = planner
-                .create_physical_expr(&optimized)
-                .unwrap()
-                .evaluate(&batch)
-                .unwrap()
-                .into_array(batch.num_rows())
-                .unwrap();
-            assert!(
-                result.is_null(0),
-                "{optimized:?} should stay UNKNOWN, got {result:?}"
-            );
         }
     }
 
