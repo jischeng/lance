@@ -1242,6 +1242,59 @@ mod tests {
         optimized
     }
 
+    #[rstest]
+    #[case::equal_true("({}) = TRUE")]
+    #[case::equal_false("({}) = FALSE")]
+    #[case::not_equal_false("({}) <> FALSE")]
+    #[case::greater_false("({}) > FALSE")]
+    #[case::less_true("({}) < TRUE")]
+    #[case::is_distinct_false("({}) IS DISTINCT FROM FALSE")]
+    #[case::is_not_distinct_true("({}) IS NOT DISTINCT FROM TRUE")]
+    #[case::in_true("({}) IN (TRUE)")]
+    #[case::not_in_false("({}) NOT IN (FALSE)")]
+    #[case::cast("CAST(({}) AS BOOLEAN)")]
+    #[case::is_true("({}) IS TRUE")]
+    #[case::is_not_false("({}) IS NOT FALSE")]
+    fn test_wrapped_memberships_preserve_separators(#[case] wrapper: &str) {
+        let values = [Some("a"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for membership in [
+            "s IN ('a','b','c','d')",
+            "s NOT IN ('a','b','c','d')",
+            "s IN ('a',NULL)",
+        ] {
+            let wrapped = wrapper.replace("{}", membership);
+            for operator in ["AND", "OR"] {
+                let sql = format!(
+                    "((s IN ('a','b','c','d') {operator} t = 'a') {operator} ({wrapped})) {operator} t = 'a'"
+                );
+                let expr = planner.parse_filter(&sql).unwrap();
+                for original in [expr.clone(), !expr.clone(), expr.is_false()] {
+                    assert_optimization_preserves_values(&planner, &batch, original);
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "DataFusion 55.2 NULL folding: https://github.com/apache/datafusion/issues/24246"]
     fn test_adjacent_disjoint_memberships_keep_unknown() {

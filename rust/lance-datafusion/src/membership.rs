@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::mem;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
@@ -118,8 +118,41 @@ fn plan_replacements(
         let membership = match classify_term(term) {
             Term::Membership(membership) => membership,
             Term::Barrier => return Ok(Vec::new()),
-            Term::Other => continue,
+            Term::Other => {
+                // Casts, CASE, and boolean functions can also expose a nested
+                // predicate. Preserve their separators even without an outer
+                // equality or IN wrapper.
+                let mut unwrapped: &Expr = term;
+                while let Expr::Not(inner) = unwrapped {
+                    unwrapped = inner;
+                }
+                let mut has_nested_predicate = false;
+                // An AND/OR boundary is already handled as its own region.
+                // Other binary wrappers must still have their operands checked.
+                if !matches!(unwrapped, Expr::BinaryExpr(binary)
+                    if matches!(binary.op, Operator::And | Operator::Or))
+                {
+                    unwrapped.apply_children(|child| {
+                        has_nested_predicate |= contains_predicate(child)?;
+                        Ok(if has_nested_predicate {
+                            TreeNodeRecursion::Stop
+                        } else {
+                            TreeNodeRecursion::Continue
+                        })
+                    })?;
+                }
+                if has_nested_predicate {
+                    return Ok(Vec::new());
+                }
+                continue;
+            }
         };
+        // A computed boolean predicate can shed its wrapper during later
+        // simplification (for example `(s IN (...)) = TRUE`). It must not be
+        // treated as an independent computed key while another column moves.
+        if contains_predicate(membership.expr)? {
+            return Ok(Vec::new());
+        }
         let group_index = if let Expr::Column(column) = membership.expr {
             *columns.entry(column).or_insert_with(|| {
                 groups.push(Vec::new());
@@ -211,6 +244,33 @@ fn plan_replacements(
         replacements.push((indices, simplified));
     }
     Ok(replacements)
+}
+
+/// Look through scalar wrappers without evaluating them or cloning their data.
+/// A boolean-valued operation below a wrapper may become a region term later.
+fn contains_predicate(expr: &Expr) -> Result<bool> {
+    let mut found = false;
+    expr.apply(|node| {
+        if matches!(
+            node,
+            Expr::InList(_)
+                | Expr::Between(_)
+                | Expr::Like(_)
+                | Expr::IsTrue(_)
+                | Expr::IsFalse(_)
+                | Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+        ) || matches!(node, Expr::BinaryExpr(binary) if matches!(binary.op,
+                Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq
+                | Operator::Gt | Operator::GtEq | Operator::And | Operator::Or))
+        {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })?;
+    Ok(found)
 }
 
 fn classify_term(mut term: &Expr) -> Term<'_> {

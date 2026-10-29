@@ -16673,10 +16673,18 @@ mod test {
         reference_scan.filter("month IS NOT NULL").unwrap();
         let expected = reference_scan.try_into_batch().await.unwrap();
         assert_eq!(expected.num_rows(), 5 * copies);
-        for use_index in [true, false] {
-            let mut scan = dataset.scan();
-            scan.use_scalar_index(use_index).filter(filter).unwrap();
-            assert_eq!(scan.try_into_batch().await.unwrap(), expected);
+        for filter in [
+            filter,
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND ((month NOT IN ('202601','202607','202608','202609')) = TRUE)) AND clip = 'target')",
+            "((((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND ((month IN ('202601','202607','202608','202609')) = FALSE)) AND clip = 'target')) IS FALSE",
+        ] {
+            for use_index in [true, false] {
+                let mut scan = dataset.scan();
+                scan.use_scalar_index(use_index).filter(filter).unwrap();
+                assert_eq!(scan.try_into_batch().await.unwrap(), expected, "{filter}");
+            }
         }
     }
 
