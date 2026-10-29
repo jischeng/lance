@@ -23,6 +23,12 @@ struct Membership<'a> {
     negated: bool,
 }
 
+enum Replacement {
+    Keep,
+    Remove,
+    Replace(Expr),
+}
+
 enum Term<'a> {
     Membership(Membership<'a>),
     /// Negating a compound predicate can expose memberships after this pass.
@@ -68,17 +74,15 @@ fn rewrite(expr: &mut Expr, simplify: &impl Fn(Expr) -> Result<Expr>) -> Result<
             if replacements.is_empty() {
                 return Ok(());
             }
-            let mut removed = vec![false; terms.len()];
-            let mut merged: Vec<_> = (0..terms.len()).map(|_| None).collect();
+            let mut edits: Vec<_> = (0..terms.len()).map(|_| Replacement::Keep).collect();
             for (indices, replacement) in replacements {
                 let last = indices[indices.len() - 1];
                 for index in indices {
-                    removed[index] = true;
+                    edits[index] = Replacement::Remove;
                 }
-                removed[last] = false;
-                merged[last] = Some(replacement);
+                edits[last] = Replacement::Replace(replacement);
             }
-            rebuild_region(expr, operator, &shape, &removed, &mut merged)?;
+            rebuild_region(expr, operator, &shape, &mut edits)?;
         }
         Expr::BinaryExpr(binary) => {
             rewrite(&mut binary.left, simplify)?;
@@ -115,44 +119,11 @@ fn plan_replacements(
     let mut groups: Vec<Vec<(usize, Membership<'_>)>> = Vec::new();
     let mut computed: Vec<&Expr> = Vec::new();
     for (index, term) in terms.iter().enumerate() {
-        let membership = match classify_term(term) {
+        let membership = match classify_term(term)? {
             Term::Membership(membership) => membership,
             Term::Barrier => return Ok(Vec::new()),
-            Term::Other => {
-                // Casts, CASE, and boolean functions can also expose a nested
-                // predicate. Preserve their separators even without an outer
-                // equality or IN wrapper.
-                let mut unwrapped: &Expr = term;
-                while let Expr::Not(inner) = unwrapped {
-                    unwrapped = inner;
-                }
-                let mut has_nested_predicate = false;
-                // An AND/OR boundary is already handled as its own region.
-                // Other binary wrappers must still have their operands checked.
-                if !matches!(unwrapped, Expr::BinaryExpr(binary)
-                    if matches!(binary.op, Operator::And | Operator::Or))
-                {
-                    unwrapped.apply_children(|child| {
-                        has_nested_predicate |= contains_predicate(child)?;
-                        Ok(if has_nested_predicate {
-                            TreeNodeRecursion::Stop
-                        } else {
-                            TreeNodeRecursion::Continue
-                        })
-                    })?;
-                }
-                if has_nested_predicate {
-                    return Ok(Vec::new());
-                }
-                continue;
-            }
+            Term::Other => continue,
         };
-        // A computed boolean predicate can shed its wrapper during later
-        // simplification (for example `(s IN (...)) = TRUE`). It must not be
-        // treated as an independent computed key while another column moves.
-        if contains_predicate(membership.expr)? {
-            return Ok(Vec::new());
-        }
         let group_index = if let Expr::Column(column) = membership.expr {
             *columns.entry(column).or_insert_with(|| {
                 groups.push(Vec::new());
@@ -273,13 +244,13 @@ fn contains_predicate(expr: &Expr) -> Result<bool> {
     Ok(found)
 }
 
-fn classify_term(mut term: &Expr) -> Term<'_> {
+fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
     let mut negated = false;
     while let Expr::Not(inner) = term {
         negated = !negated;
         term = inner;
     }
-    match term {
+    let classified = match term {
         Expr::InList(list) => Term::Membership(Membership {
             expr: &list.expr,
             values: &list.list,
@@ -287,12 +258,12 @@ fn classify_term(mut term: &Expr) -> Term<'_> {
         }),
         Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq | Operator::NotEq) => {
             let (expr, value) = match (binary.left.as_ref(), binary.right.as_ref()) {
-                (Expr::Column(_), Expr::Column(_)) => return Term::Other,
+                (Expr::Column(_), Expr::Column(_)) => return Ok(Term::Other),
                 (expr, value @ Expr::Literal(_, _))
                 | (value @ Expr::Literal(_, _), expr)
                 | (expr @ Expr::Column(_), value)
                 | (value, expr @ Expr::Column(_)) => (expr, value),
-                _ => return Term::Barrier,
+                _ => return Ok(Term::Barrier),
             };
             Term::Membership(Membership {
                 expr,
@@ -322,7 +293,36 @@ fn classify_term(mut term: &Expr) -> Term<'_> {
         Expr::Column(_) | Expr::IsNull(_) | Expr::IsNotNull(_) => Term::Other,
         _ if negated => Term::Barrier,
         _ => Term::Other,
-    }
+    };
+    // Boolean wrappers may disappear in a later simplifier pass. Keep their
+    // separators unless this is an independently rewritten AND/OR boundary.
+    let has_predicate = match &classified {
+        Term::Membership(membership) => contains_predicate(membership.expr)?,
+        Term::Barrier => return Ok(Term::Barrier),
+        Term::Other
+            if matches!(term, Expr::BinaryExpr(binary)
+            if matches!(binary.op, Operator::And | Operator::Or)) =>
+        {
+            false
+        }
+        Term::Other => {
+            let mut found = false;
+            term.apply_children(|child| {
+                found = contains_predicate(child)?;
+                Ok(if found {
+                    TreeNodeRecursion::Stop
+                } else {
+                    TreeNodeRecursion::Continue
+                })
+            })?;
+            found
+        }
+    };
+    Ok(if has_predicate {
+        Term::Barrier
+    } else {
+        classified
+    })
 }
 
 /// Prune replaced terms without changing the parenthesization of those kept.
@@ -330,8 +330,7 @@ fn rebuild_region(
     expr: &mut Expr,
     operator: Operator,
     shape: &[bool],
-    removed: &[bool],
-    merged: &mut [Option<Expr>],
+    edits: &mut [Replacement],
 ) -> Result<()> {
     let original = mem::replace(expr, Expr::Literal(ScalarValue::Null, None));
     let mut pending = vec![Some(original)];
@@ -353,10 +352,10 @@ fn rebuild_region(
                     pending.push(Some(*binary.right));
                     pending.push(Some(*binary.left));
                 } else {
-                    rebuilt.push(if removed[index] {
-                        None
-                    } else {
-                        Some(merged[index].take().unwrap_or(term))
+                    rebuilt.push(match mem::replace(&mut edits[index], Replacement::Keep) {
+                        Replacement::Keep => Some(term),
+                        Replacement::Remove => None,
+                        Replacement::Replace(expr) => Some(expr),
                     });
                     index += 1;
                 }
@@ -571,13 +570,16 @@ mod tests {
         assert_eq!(rewritten, original);
     }
 
-    #[test]
-    fn merges_memberships_around_a_column_comparison() {
+    #[rstest::rstest]
+    #[case::column_comparison(col("t").eq(col("u")))]
+    #[case::literal_comparison(col("i").eq(lit(1)))]
+    fn groups_separated_memberships_once(#[case] separator: Expr) {
         let original = col("s")
             .in_list(vec![lit("a"), lit("b")], false)
-            .and(col("t").eq(col("u")))
+            .and(separator)
             .and(col("s").in_list(vec![lit("b"), lit("c")], false));
         let calls = Cell::new(0);
+        // Even if simplification leaves the group unchanged, do not revisit it.
         let rewritten = simplify_membership_regions(original.clone(), &|expr| {
             calls.set(calls.get() + 1);
             Ok(expr)
@@ -585,21 +587,5 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 1);
         assert_ne!(rewritten, original);
-    }
-
-    #[test]
-    fn simplifies_each_region_once() {
-        let original = col("s")
-            .in_list(vec![lit("a"), lit("b")], false)
-            .and(col("i").eq(lit(1)))
-            .and(col("s").in_list(vec![lit("b"), lit("c")], false));
-        let calls = Cell::new(0);
-        // A non-improving simplifier must not cause the output to be revisited.
-        simplify_membership_regions(original, &|expr| {
-            calls.set(calls.get() + 1);
-            Ok(expr)
-        })
-        .unwrap();
-        assert_eq!(calls.get(), 1);
     }
 }

@@ -1587,21 +1587,27 @@ mod tests {
                 MembershipSet::ABNull,
                 MembershipSet::Abc,
             ] {
+                let a = first_set.expression("s", negated[0]);
+                let b = second_set.expression("t", negated[1]);
+                let c = third_set.expression("s", negated[2]);
+                // These single-group cases do not depend on the fourth term.
+                for original in [
+                    join(join(a.clone(), b.clone()), c.clone()),
+                    join(c.clone(), join(b.clone(), a.clone())),
+                ] {
+                    for original in [original.clone(), !original] {
+                        assert_optimization_preserves_values(&planner, &batch, original);
+                    }
+                }
                 for fourth_set in [MembershipSet::A, MembershipSet::B, MembershipSet::AB] {
-                    let a = first_set.expression("s", negated[0]);
-                    let b = second_set.expression("t", negated[1]);
-                    let c = third_set.expression("s", negated[2]);
                     let d = fourth_set.expression("t", negated[3]);
-                    // Single-group and interleaved cases share the same value
-                    // domain and comparison helper. Include every tree shape.
+                    // All five parenthesizations of four interleaved terms.
                     for original in [
-                        join(join(a.clone(), b.clone()), c.clone()),
-                        join(c.clone(), join(b.clone(), a.clone())),
                         join(join(join(a.clone(), b.clone()), c.clone()), d.clone()),
                         join(join(a.clone(), join(b.clone(), c.clone())), d.clone()),
                         join(a.clone(), join(join(b.clone(), c.clone()), d.clone())),
                         join(a.clone(), join(b.clone(), join(c.clone(), d.clone()))),
-                        join(join(a, b), join(c, d)),
+                        join(join(a.clone(), b.clone()), join(c.clone(), d)),
                     ] {
                         for original in [original.clone(), !original] {
                             assert_optimization_preserves_values(&planner, &batch, original);
