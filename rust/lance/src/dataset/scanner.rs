@@ -16676,6 +16676,10 @@ mod test {
         for filter in [
             filter,
             "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND array_has(['x','y','z','w'], month)) AND clip = 'target')",
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND (month LIKE 'x' OR month LIKE 'y')) AND clip = 'target')",
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
                 AND ((month NOT IN ('202601','202607','202608','202609')) = TRUE)) AND clip = 'target')",
             "((((month IN ('202601','202607','202608','202609') AND clip = 'target') \
                 AND ((month IN ('202601','202607','202608','202609')) = FALSE)) AND clip = 'target')) IS FALSE",

@@ -15,6 +15,8 @@ use datafusion::scalar::ScalarValue;
 // Computed memberships are never merged. Bound their structural comparisons
 // so generated filters cannot turn this safety check into quadratic work.
 const MAX_COMPUTED_MEMBERSHIPS: usize = 32;
+// Avoid repeatedly scanning large nested regions merely to prove a boundary safe.
+const MAX_BOUNDARY_TERMS: usize = 32;
 
 /// A borrowed membership, including equality and explicit NOT spellings.
 struct Membership<'a> {
@@ -284,15 +286,33 @@ fn classify_term(mut term: &Expr) -> Result<Term<'_>> {
             // it cannot expose IN/Eq predicates or distribute a boolean region.
             Term::Other
         }
-        Expr::BinaryExpr(binary)
-            if negated && matches!(binary.op, Operator::And | Operator::Or) =>
-        {
-            Term::Barrier
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            // A boundary is safe only if every term is understood. LIKE and
+            // scalar functions can become memberships in a subsequent pass.
+            let mut pending = vec![term];
+            let mut visited = 0;
+            while let Some(child) = pending.pop() {
+                visited += 1;
+                if visited > MAX_BOUNDARY_TERMS {
+                    return Ok(Term::Barrier);
+                }
+                match child {
+                    Expr::BinaryExpr(inner) if matches!(inner.op, Operator::And | Operator::Or) => {
+                        pending.push(&inner.left);
+                        pending.push(&inner.right);
+                    }
+                    child if matches!(classify_term(child)?, Term::Barrier) => {
+                        return Ok(Term::Barrier);
+                    }
+                    _ => {}
+                }
+            }
+            if negated { Term::Barrier } else { Term::Other }
         }
-        // NOT bool and NOT (IS NULL) cannot become a same-column membership.
-        Expr::Column(_) | Expr::IsNull(_) | Expr::IsNotNull(_) => Term::Other,
-        _ if negated => Term::Barrier,
-        _ => Term::Other,
+        // Only explicit safe separators are allowed. Unknown predicates may
+        // simplify into memberships, even if they contain no predicate today.
+        Expr::Column(_) | Expr::Literal(_, _) | Expr::IsNull(_) | Expr::IsNotNull(_) => Term::Other,
+        _ => Term::Barrier,
     };
     // Boolean wrappers may disappear in a later simplifier pass. Keep their
     // separators unless this is an independently rewritten AND/OR boundary.

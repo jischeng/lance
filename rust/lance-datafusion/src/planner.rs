@@ -1296,6 +1296,38 @@ mod tests {
     }
 
     #[rstest]
+    #[case::array_has("array_has(['x','y','z','w'], s)")]
+    #[case::like_union("s LIKE 'x' OR s LIKE 'y'")]
+    fn test_hidden_memberships_preserve_separators(#[case] hidden: &str) {
+        let values = [Some("a"), Some("x"), Some("outside"), None];
+        let batch = arrow_array::record_batch!(
+            (
+                "s",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|s| values.iter().map(move |_| *s))
+                    .collect::<Vec<_>>()
+            ),
+            (
+                "t",
+                Utf8,
+                values
+                    .iter()
+                    .flat_map(|_| values.iter().copied())
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let sql = format!("((s IN ('a','b','c','d') AND t='a') AND ({hidden})) AND t='a'");
+        let expr = planner.parse_filter(&sql).unwrap();
+        for original in [expr.clone(), !expr.clone(), expr.is_false()] {
+            assert_optimization_preserves_values(&planner, &batch, original);
+        }
+    }
+
+    #[rstest]
     #[case::separated(
         "s IN ('a','b','c','d') AND i = 1 AND s IN ('b','c')",
         "i = 1 AND s IN ('b','c')"
